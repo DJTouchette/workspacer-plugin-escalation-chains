@@ -37,6 +37,7 @@
   ],
   "capabilities": [
     "agents.spawn",
+    "agents.sendMessage",
     "claude.handoffBrief",
     "notifications.post"
   ],

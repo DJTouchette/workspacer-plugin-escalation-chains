@@ -2,20 +2,32 @@
 
 Self-healing fleet: auto-spawn a successor when an agent fails.
 
-A [workspacer](https://github.com/DJTouchette/workspacer) hub plugin (sidecar). **Runnable scaffold** — it loads, connects to the hub bus, and shows live activity; the real logic is stubbed with clear TODOs.
+A [workspacer](https://github.com/DJTouchette/workspacer) hub plugin (sidecar). When an agent dies or a workflow fails, it automatically stands up a replacement in the same directory — with a handoff brief for continuity — so the fleet keeps moving instead of silently stalling.
 
 ## What it does
 
-On `workflow.failed` or a session going `stopped`, automatically `agents.spawn` a successor (or `claude.handoffBrief` to hand off context) so a stuck agent escalates instead of silently dying.
+The sidecar listens on the hub bus for failures and reacts:
+
+- **Triggers.** A `workflow.failed` event, or an `agent.state_changed` where `mode === "stopped"` (an agent that ended / died). Both are edge-triggered.
+- **Continuity brief.** Best-effort `claude.handoffBrief({ sessionId })` against the failed session; the resulting brief path is handed to the successor.
+- **Spawn a successor.** `agents.spawn({ cwd, model, label, parentSessionId })` in the **same cwd**, using `successorModel` (or the host default). The returned `sessionId` is then driven with `agents.sendMessage` — once the fresh agent reaches its input prompt (retried with backoff) — to deliver *"The previous agent failed. Continue where it left off and fix the failure."* plus a pointer to the handoff brief.
+  - If `agents.spawn` is unavailable (e.g. the desktop side is down), it falls back to publishing a `command.spawn_agent { cwd, name, model }` event. It never does both, so no duplicate successors.
+- **Retry cap + dedup.** Retries are counted per **failure chain** (keyed by `runId`, else `sessionId`, else `cwd`). A successor inherits its parent's chain, so a successor that *also* dies keeps counting against the same cap instead of starting a runaway new chain. Concurrent events for the same chain are de-duplicated (an in-flight guard), so one failure produces one successor.
+- **Give up once.** When a chain reaches `maxRetries`, it posts a single "Escalation exhausted" notification and stops. Every spawn also posts a notification via `notifications.post`.
+
+Set `maxRetries` to `0` to disable auto-retry entirely (the plugin then just observes).
+
+The status pane (📗 icon) shows connection state, the resolved settings, and the number of active failure chains.
 
 ## Bus wiring
 
 - **Subscribes to:** `workflow.failed`, `agent.state_changed`
-- **Calls capabilities:** `agents.spawn`, `claude.handoffBrief`, `notifications.post`
-- **Emits:** `command.spawn_agent`
+- **Calls capabilities:** `agents.spawn`, `agents.sendMessage`, `claude.handoffBrief`, `notifications.post`
+  - `agents.sendMessage` was added to the manifest beyond the original scaffold: `agents.spawn` has no initial-prompt parameter, so delivering the "continue where you left off" instruction to the new agent requires a follow-up message.
+- **Emits:** `command.spawn_agent` (fallback spawn path only)
 - **Settings:**
-- `maxRetries` (number) — How many successors to spawn before giving up.
-- `successorModel` (string) — Model for the spawned successor ('' = default).
+- `maxRetries` (number, default 1) — How many successors to spawn per failure chain before giving up (`0` disables).
+- `successorModel` (string, default `""`) — Model for the spawned successor (`""` = host default).
 
 ## Run it
 
@@ -26,7 +38,7 @@ On `workflow.failed` or a session going `stopped`, automatically `agents.spawn` 
 
 ## Implement
 
-Edit `server.js` → `onEvent(event)`. Subscribed topics arrive there; use `call('method', params)` for capabilities and `publish('command.x', data)` for commands. `settings` holds the host-injected config above.
+The behavior lives in `server.js` → `onEvent(event)` and the `escalate(...)` helper. Subscribed events arrive at `onEvent`; capabilities go through `call('method', params)`, commands through `publish('command.x', data)`, and `settings` holds the host-injected config above. Zero dependencies (Node ≥ 22 built-ins only), with reconnect-on-disconnect preserved from the scaffold.
 
 ## Layout
 
