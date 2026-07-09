@@ -1,0 +1,50 @@
+{
+  "id": "djtouchette.escalation-chains",
+  "name": "Escalation Chains",
+  "apiVersion": "1",
+  "server": {
+    "command": "node",
+    "args": [
+      "server.js"
+    ],
+    "port": 9204,
+    "health": "/health"
+  },
+  "panes": [
+    {
+      "type": "djtouchette.escalation-chains",
+      "title": "Escalation Chains",
+      "icon": "\ud83d\udd17",
+      "scope": "global",
+      "path": "/"
+    }
+  ],
+  "settings": [
+    {
+      "key": "maxRetries",
+      "label": "Max auto-retries",
+      "type": "number",
+      "default": 1,
+      "help": "How many successors to spawn before giving up."
+    },
+    {
+      "key": "successorModel",
+      "label": "Successor model",
+      "type": "string",
+      "default": "",
+      "help": "Model for the spawned successor ('' = default)."
+    }
+  ],
+  "capabilities": [
+    "agents.spawn",
+    "claude.handoffBrief",
+    "notifications.post"
+  ],
+  "emits": [
+    "command.spawn_agent"
+  ],
+  "consumes": [
+    "workflow.failed",
+    "agent.state_changed"
+  ]
+}
