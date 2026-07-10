@@ -264,8 +264,7 @@ const server = http.createServer((req, res) => {
     + ' · active chains=' + escapeHtml(String(retries.size)) + '</p>'
     + '<pre style="font-size:.7rem;color:var(--wks-text-faint,#777);white-space:pre-wrap">'
     + (recent.map(escapeHtml).join('\n') || 'waiting for events…') + '</pre>'
-    + '<p style="color:var(--wks-text-faint,#777);font-size:.7rem">Scaffold — edit '
-    + '<code>server.js</code> (onEvent) to implement.</p>');
+);
 });
 function escapeHtml(s) { return String(s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c])); }
 server.listen(PORT, '127.0.0.1', () => log('pane on http://127.0.0.1:' + PORT));
