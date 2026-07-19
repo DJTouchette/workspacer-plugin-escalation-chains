@@ -7,26 +7,20 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const { connect } = require('./wks.js');
 
 const DIR = __dirname;
 const manifest = JSON.parse(fs.readFileSync(path.join(DIR, 'plugin.json'), 'utf8'));
 const PORT = Number(process.env.PORT || (manifest.server && manifest.server.port) || 9200);
 
-// The hub injects the bus URL + this plugin's scoped token. Accept the common
-// conventions so the scaffold runs however your hub wires it.
-const BUS_URL = process.env.WKS_BUS_URL || 'ws://127.0.0.1:7895/bus';
-function readToken() {
-  if (process.env.WKS_BUS_TOKEN) return process.env.WKS_BUS_TOKEN;
-  try { return fs.readFileSync(path.join(DIR, '.bus-token'), 'utf8').trim(); } catch { return ''; }
-}
-// Host-injected settings (from manifest `settings`), passed as JSON in env.
-let settings = {};
-try { settings = JSON.parse(process.env.WKS_SETTINGS || '{}'); } catch {}
+// Connect to the hub bus via the vendored plugin SDK (wks.js). It reads the
+// scoped token (HUB_TOKEN / WKS_BUS_TOKEN / .bus-token), subscribes, delivers
+// events, and reconnects if the hub goes away. Settings come from the SDK too.
+const wks = connect({ source: manifest.id });
+const settings = wks.settings;
 
 const TOPICS = manifest.consumes || [];
 const recent = [];
-let ws = null, connected = false, callSeq = 0;
-const pending = new Map();
 
 function log(msg) {
   console.log('[' + manifest.id + '] ' + msg);
@@ -34,38 +28,10 @@ function log(msg) {
   if (recent.length > 100) recent.pop();
 }
 
-// Call a hub capability (must be declared in plugin.json `capabilities`).
-function call(method, params) {
-  return new Promise((resolve, reject) => {
-    if (!connected) return reject(new Error('not connected'));
-    const id = 'c' + (++callSeq);
-    pending.set(id, { resolve, reject });
-    ws.send(JSON.stringify({ op: 'call', id, method, params: params || {} }));
-    setTimeout(() => { if (pending.has(id)) { pending.delete(id); reject(new Error('timeout')); } }, 8000);
-  });
-}
-// Publish an event/command (must be declared in `emits`).
-function publish(type, data) {
-  if (connected) ws.send(JSON.stringify({ op: 'publish', event: { type, source: manifest.id, data: data || {} } }));
-}
-
-function connect() {
-  const tok = readToken();
-  ws = new WebSocket(BUS_URL + (tok ? '?token=' + encodeURIComponent(tok) : ''));
-  ws.addEventListener('open', () => {
-    connected = true;
-    if (TOPICS.length) ws.send(JSON.stringify({ op: 'subscribe', topics: TOPICS }));
-    log('connected; subscribed to ' + (TOPICS.join(', ') || '(nothing)'));
-  });
-  ws.addEventListener('message', (ev) => {
-    let f; try { f = JSON.parse(ev.data); } catch { return; }
-    if (f.op === 'event' && f.event) onEvent(f.event).catch((e) => log('onEvent error: ' + e.message));
-    else if (f.op === 'result' && pending.has(f.id)) { pending.get(f.id).resolve(f.result); pending.delete(f.id); }
-    else if (f.op === 'error' && pending.has(f.id)) { pending.get(f.id).reject(new Error(f.error)); pending.delete(f.id); }
-  });
-  ws.addEventListener('close', () => { connected = false; setTimeout(connect, 1500); });
-  ws.addEventListener('error', () => { try { ws.close(); } catch {} });
-}
+// Route each consumed topic to onEvent (the SDK subscribes to '*' internally).
+for (const t of TOPICS) wks.on(t, (data, event) => onEvent(event).catch((e) => log('onEvent error: ' + e.message)));
+// Log once per (re)connect, mirroring the old open handler.
+wks.onStatus((c) => { if (c) log('connected; subscribed to ' + (TOPICS.join(', ') || '(nothing)')); });
 
 // ── Escalation Chains: self-healing fleet ──────────────────────────────────────
 //
@@ -118,7 +84,7 @@ async function deliverPrompt(successorId, text) {
   for (let i = 0; i < MAX_TRIES; i++) {
     await new Promise((r) => setTimeout(r, 3000));
     try {
-      await call('agents.sendMessage', { sessionId: successorId, text });
+      await wks.call('agents.sendMessage', { sessionId: successorId, text });
       log('delivered continue-prompt to successor ' + successorId);
       return;
     } catch (e) {
@@ -130,7 +96,7 @@ async function deliverPrompt(successorId, text) {
 
 async function notify(title, body) {
   try {
-    await call('notifications.post', { title, body });
+    await wks.call('notifications.post', { title, body });
   } catch (e) {
     log('notifications.post failed: ' + e.message);
   }
@@ -165,7 +131,7 @@ async function escalate({ runId, sessionId, cwd, label }) {
     let briefPath;
     if (sessionId) {
       try {
-        const b = await call('claude.handoffBrief', { sessionId });
+        const b = await wks.call('claude.handoffBrief', { sessionId });
         if (b && b.path) briefPath = b.path;
       } catch (e) {
         log('handoffBrief failed for ' + sessionId + ': ' + e.message);
@@ -181,7 +147,7 @@ async function escalate({ runId, sessionId, cwd, label }) {
     // we'd create duplicate successors.
     let successorId;
     try {
-      const r = await call('agents.spawn', {
+      const r = await wks.call('agents.spawn', {
         cwd,
         model,
         label: spawnLabel,
@@ -190,7 +156,7 @@ async function escalate({ runId, sessionId, cwd, label }) {
       successorId = r && r.sessionId;
     } catch (e) {
       log('agents.spawn failed (' + e.message + ') — falling back to command.spawn_agent');
-      publish('command.spawn_agent', { cwd, name: spawnLabel, model });
+      wks.publish('command.spawn_agent', { cwd, name: spawnLabel, model });
     }
 
     // Count the retry now (before async prompt delivery) so a redelivered event
@@ -256,7 +222,7 @@ const server = http.createServer((req, res) => {
     + 'background:var(--wks-bg-base,#161616);color:var(--wks-text-primary,#e8e8e8);margin:0;padding:14px">'
     + '<h2 style="font-size:1rem">' + manifest.name + '</h2>'
     + '<p style="color:var(--wks-text-muted,#888);font-size:.8rem">'
-    + (connected ? '\u{1F7E2} connected to hub' : '\u{1F534} disconnected')
+    + (wks.connected ? '\u{1F7E2} connected to hub' : '\u{1F534} disconnected')
     + ' · subscribed to ' + (TOPICS.join(', ') || '(nothing)') + '</p>'
     + '<p style="color:var(--wks-text-muted,#888);font-size:.75rem">'
     + 'maxRetries=' + escapeHtml(String(maxRetries))
@@ -268,4 +234,3 @@ const server = http.createServer((req, res) => {
 });
 function escapeHtml(s) { return String(s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c])); }
 server.listen(PORT, '127.0.0.1', () => log('pane on http://127.0.0.1:' + PORT));
-connect();
