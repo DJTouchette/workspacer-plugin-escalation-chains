@@ -94,17 +94,22 @@ async function deliverPrompt(successorId, text) {
   log('could not deliver continue-prompt to successor ' + successorId + ' (still not ready)');
 }
 
-async function notify(title, body) {
+// Post to the in-app notification center (+ OS toast unless disabled). Callers
+// pass level/sessionId/key: sessionId is the click target (jump to the live
+// successor, not the corpse) and key holds one slot per failure chain so a
+// chain that fires repeatedly replaces its entry instead of stacking.
+async function notify(fields) {
   try {
-    await wks.call('notifications.post', { title, body });
+    await wks.call('notifications.post', { source: 'plugin:' + manifest.id, ...fields });
   } catch (e) {
     log('notifications.post failed: ' + e.message);
   }
 }
 
 // Core: react to one detected failure. `sessionId`/`cwd` describe the agent that
-// failed; `label` is a human tag for logs/notifications.
-async function escalate({ runId, sessionId, cwd, label }) {
+// failed; `label` is a human tag for logs/notifications; `reason` (optional) is
+// the failure reason carried by the triggering event.
+async function escalate({ runId, sessionId, cwd, label, reason }) {
   const chainKey = chainKeyFor({ runId, sessionId, cwd });
 
   // Concurrency dedup: two near-simultaneous events for the same chain must not
@@ -117,10 +122,17 @@ async function escalate({ runId, sessionId, cwd, label }) {
       if (!exhaustedNotified.has(chainKey)) {
         exhaustedNotified.add(chainKey);
         log('chain ' + chainKey + ' exhausted after ' + used + ' retries — giving up');
-        await notify(
-          'Escalation exhausted',
-          `Gave up on ${label} after ${used} auto-retr${used === 1 ? 'y' : 'ies'} in ${cwd || 'unknown dir'}.`,
-        );
+        // Chain is out of retries — a human has to take over. Same key as the
+        // chain's "successor spawned" warnings, so the error replaces them.
+        await notify({
+          title: label + ' failed — retries exhausted',
+          body:
+            `Gave up on ${label} after ${used} auto-retr${used === 1 ? 'y' : 'ies'} in ${cwd || 'unknown dir'}.` +
+            (reason ? ` Last failure: ${reason}.` : '') + ' Needs a human.',
+          level: 'error',
+          sessionId: sessionId || undefined,
+          key: 'escalation-chains:' + chainKey,
+        });
       }
       return;
     }
@@ -174,11 +186,19 @@ async function escalate({ runId, sessionId, cwd, label }) {
       'escalated ' + label + ' -> successor ' + (successorId || '(via command.spawn_agent)') +
         ' (retry ' + attempt + '/' + maxRetries + ')',
     );
-    await notify(
-      'Escalation: spawned successor',
-      `Auto-retry ${attempt}/${maxRetries} for ${label} in ${cwd || 'unknown dir'}` +
+    // Click target is the NEW successor session — the user should land on the
+    // live replacement, not the corpse. On the command.spawn_agent fallback we
+    // have no successor id, so the notification is simply not session-linked.
+    await notify({
+      title: label + ' failed — successor spawned',
+      body:
+        (reason ? `${reason}. ` : '') +
+        `Attempt ${attempt} of ${maxRetries} in ${cwd || 'unknown dir'}` +
         (briefPath ? ' (with handoff brief)' : '') + '.',
-    );
+      level: 'warn',
+      sessionId: successorId || undefined,
+      key: 'escalation-chains:' + chainKey,
+    });
   } finally {
     inflight.delete(chainKey);
   }
@@ -194,7 +214,12 @@ async function onEvent(event) {
   try {
     if (type === 'workflow.failed') {
       const { sessionId, cwd, runId, name } = data;
-      await escalate({ runId, sessionId, cwd, label: name ? `workflow "${name}"` : 'workflow' });
+      const reason =
+        (typeof data.error === 'string' && data.error) ||
+        (typeof data.reason === 'string' && data.reason) ||
+        (typeof data.message === 'string' && data.message) ||
+        'workflow failed';
+      await escalate({ runId, sessionId, cwd, label: name ? `workflow "${name}"` : 'workflow', reason });
       return;
     }
 
@@ -205,7 +230,12 @@ async function onEvent(event) {
       // endless chain of replacements.
       const { sessionId, cwd, mode } = data;
       if (mode === 'stopped') {
-        await escalate({ sessionId, cwd, label: 'agent ' + (sessionId ? String(sessionId).slice(0, 8) : '') });
+        await escalate({
+          sessionId,
+          cwd,
+          label: 'agent ' + (sessionId ? String(sessionId).slice(0, 8) : ''),
+          reason: 'session stopped unexpectedly',
+        });
       }
       return;
     }
